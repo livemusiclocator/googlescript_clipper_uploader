@@ -7,8 +7,9 @@ Create a Google Apps Script associated with a Google Sheet to automate the proce
 2.  Check for potential duplicate gigs already existing in the LML system via a public API (`/gigs/query`).
 3.  Format the data for non-duplicate gigs into the required "Clipper" style (multi-line `key: value` format ending with `---`).
 4.  Authenticate using a session cookie (`_lml_session`) and submit the formatted data, including a CSRF token, to the LML admin upload endpoint (`/admin/uploads`).
-5.  Provide clear feedback within the sheet regarding the status of each row (Uploaded, Suspected Duplicate, Failed) in dedicated columns.
-6.  Integrate the trigger seamlessly into the existing custom menu structure within the sheet's Apps Script project.
+5.  Upload gigs in small batches to improve error handling granularity.
+6.  Provide clear feedback within the sheet regarding the status of each row (Uploaded, Suspected Duplicate, Failed) in dedicated columns, including highlighting failed batches.
+7.  Integrate the trigger seamlessly into the existing custom menu structure within the sheet's Apps Script project.
 
 ## Core Logic Sources
 
@@ -35,25 +36,31 @@ Create a Google Apps Script associated with a Google Sheet to automate the proce
 *   **Function:** `formatRowForClipper` processes a single row.
 *   **Input:** Sheet row data (both raw values for dates/times and display values for others), headers array.
 *   **Output:** A multi-line string with `key: value` pairs based on column names (e.g., `venue_id`, `tickets`, `date`, `time`, `name`, `venue`, `status`, `information`, `internal_description`, `set1`-`set6`, `price1`-`price2`, `Genre Tag 1`-`Genre Tag 4`), ending in `---`. Handles missing optional values appropriately.
-*   **Aggregation:** `formatDataAsClipper` iterates through non-duplicate rows, calls `formatRowForClipper`, and concatenates the resulting strings (separated by newlines) into a single payload string for the `lml_upload[content]` field.
+*   **Aggregation:** `formatDataAsClipper` iterates through rows *within a batch*, calls `formatRowForClipper`, and concatenates the resulting strings (separated by newlines) into a single payload string for the `lml_upload[content]` field for that batch.
 
-### 3. Upload Process
+### 3. Authentication & CSRF
 
 *   **Authentication:** Use the `_lml_session` cookie value stored in Script Properties (`LML_SESSION_ID`). Include this in `Cookie` headers for authenticated requests (`/admin/uploads/new` and `/admin/uploads`).
 *   **CSRF Token:**
-    *   Fetch the token by making a GET request to `/admin/uploads/new` (authenticated).
+    *   Fetch the token **once** before starting batch uploads by making a GET request to `/admin/uploads/new` (authenticated).
     *   Parse the HTML response using regex to extract the `authenticity_token` value from the input field.
-*   **Submission:**
-    *   Make a POST request to `/admin/uploads`.
-    *   Include required headers (`Cookie`, `Content-Type: application/x-www-form-urlencoded`, `Referer`, `Origin`, `User-Agent`).
-    *   Include payload: `authenticity_token`, `lml_upload[source]` (generated label), `lml_upload[content]` (the concatenated Clipper string), `commit: 'Create Upload'`, and empty `lml_upload[venue_label]` / `lml_upload[venue_id]` fields (matching Python script).
-    *   Set `followRedirects: false` and `muteHttpExceptions: true`.
-*   **Response Handling:**
-    *   Check response code (302 redirect usually indicates success).
-    *   If successful (302), attempt to parse the Upload ID from the `Location` header (assuming UUID format).
-    *   If failed (e.g., 422), attempt to parse error messages from the HTML response body.
 
-### 4. Feedback Mechanism (In-Sheet)
+### 4. Batch Upload Processing (Implemented - Option C)
+
+*   **Batching:** Valid, non-duplicate rows are divided into small batches (size configured by `UPLOAD_CONFIG.BATCH_SIZE`, default 5).
+*   **Iteration:** The script loops through each batch sequentially.
+*   **Submission per Batch:**
+    *   Make a POST request to `/admin/uploads` for *each batch*.
+    *   Include required headers (`Cookie`, `Content-Type: application/x-www-form-urlencoded`, `Referer`, `Origin`, `User-Agent`).
+    *   Include payload: `authenticity_token`, `lml_upload[source]` (generated label including user email), `lml_upload[content]` (the concatenated Clipper string *for the current batch*), `commit: 'Create Upload'`, and empty `lml_upload[venue_label]` / `lml_upload[venue_id]` fields.
+    *   Set `followRedirects: false` and `muteHttpExceptions: true`.
+*   **Response Handling per Batch:**
+    *   Check response code (302 redirect usually indicates success).
+    *   If successful (302), attempt to parse the Upload ID from the `Location` header.
+    *   If failed (e.g., 422), attempt to parse error messages from the HTML response body.
+*   **Continuation:** Processing continues to the next batch regardless of the success or failure of the current batch.
+
+### 5. Feedback Mechanism (In-Sheet)
 
 *   **Required Columns:** Ensure the following columns exist in the sheet (create if missing via `ensureFeedbackColumnsExist`):
     *   `Upload Status`
@@ -62,18 +69,18 @@ Create a Google Apps Script associated with a Google Sheet to automate the proce
 *   **Workflow:**
     1.  **Clear:** Before processing, clear existing content in the feedback columns for the relevant rows.
     2.  **Duplicates:** Write "Suspected Duplicate..." status during the duplicate check phase.
-    3.  **Validation/Formatting Errors:** Write specific errors to `Upload Error` if basic validation or Clipper formatting fails for a row.
-    4.  **Upload Attempt:** For the batch of non-duplicate, valid rows:
-        *   **Success:** Write "Uploaded" to `Upload Status` and the extracted ID (if any) to `Upload ID` for all rows in the batch. Clear `Upload Error`.
-        *   **Failure:** Write "Upload Failed" to `Upload Status` and the error details from the server/request to `Upload Error` for all rows in the batch.
+    3.  **Validation/Formatting Errors:** Write specific errors to `Upload Error` if basic validation or Clipper formatting fails for a row/batch.
+    4.  **Upload Attempt (Per Batch):** For each batch:
+        *   **Success:** Write "Uploaded" to `Upload Status` and the extracted ID (if any) to `Upload ID` for all rows in the batch. Clear `Upload Error` and background color.
+        *   **Failure:** Write "Upload Failed" to `Upload Status` and the error details from the server/request to `Upload Error` for all rows in the batch. Set the background color of these rows to pink (`UPLOAD_CONFIG.ERROR_BACKGROUND_COLOR`).
 
-### 5. Integration
+### 6. Integration
 
 *   **Script Files:** Logic resides primarily in `UploadLogic.gs`. Menu creation is handled in the user's existing active script file (e.g., `Code.gs`, `index.gs`). The local `samplegs.gs` file is informational only and not part of the active project.
 *   **Menu Item:** The existing `onOpen` function in the active script file was modified to create a single "Live Music Locator" menu, incorporating the original items plus a new item: `Upload Gigs with Check` which calls the `uploadGigsWithCheck` function in `UploadLogic.gs`.
 
 
-### 6. Configuration (Script Properties)
+### 7. Configuration (Script Properties)
 
 Store the following values in `File > Project properties > Script properties`:
 *   `LML_BASE_URL`: Base URL of the LML application (e.g., `https://api.lml.live`).
@@ -99,12 +106,13 @@ Store the following values in `File > Project properties > Script properties`:
     d. Write "Suspected Duplicate..." status to sheet.
 9.  Filter out rows marked as duplicates or having validation errors (e.g., invalid date).
 10. If valid, non-duplicate rows exist:
-    a. Format these rows into a single Clipper string payload using `formatDataAsClipper` and `formatRowForClipper`. Handle potential formatting errors.
-    b. Fetch CSRF token from `/admin/uploads/new` using the session cookie. Handle errors.
-    c. Submit Clipper data payload to `/admin/uploads` via POST request (authenticated). Handle errors.
-    d. Parse response (success/failure, potential Upload ID, error message).
-    e. Write final status ("Uploaded"/"Upload Failed"), ID, and error message back to the sheet for the processed batch.
-11. Provide summary alert/log message to the user.
+    a. Fetch CSRF token **once** from `/admin/uploads/new`. Handle errors.
+    b. **Loop through valid rows in small batches:**
+        i. Format rows *in the current batch* into a Clipper string payload. Handle formatting errors for the batch.
+        ii. Submit Clipper data payload for the *current batch* to `/admin/uploads` via POST. Handle submission errors for the batch.
+        iii. Parse response (success/failure, potential Upload ID, error message) for the batch.
+        iv. Write final status ("Uploaded"/"Upload Failed"), ID, error message, and background color back to the sheet for rows *in the current batch*.
+11. Provide summary alert/log message to the user detailing batch processing results.
 
 ## Testing
 
